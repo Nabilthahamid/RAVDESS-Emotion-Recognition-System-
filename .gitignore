@@ -9,7 +9,6 @@ esra_rela_pp_v15_1_lora_results/
 esra_rela_pp_v15_1_no_lora_cache/ 
 esra_rela_pp_v15_1_no_lora_results/ 
 esra_rela_pp_v15_1_simpleavg_no_lora_cache/ 
-esra_rela_pp_v15_1_simpleavg_no_lora_results/ 
  
 # Temporary/debug files 
 *.txt 
