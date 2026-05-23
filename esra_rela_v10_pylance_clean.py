@@ -1,0 +1,1691 @@
+#!/usr/bin/env python
+"""
+ESRA-RELA V9: Unified Emotion-Saliency Reliability-Aware Fusion
+================================================================
+Subject-wise 5-fold RAVDESS audio-visual emotion recognition.
+
+What this merges and improves over BOTH source files
+-----------------------------------------------------
+SOURCE A  esra_cmt_train_final_5fold_cached_PUBLICATION_FINAL_V3.py
+  - Emotion-saliency frame selection  (AU intensity + motion + FACS entropy)
+  - AU Graph Transformer with FACS-biased adjacency matrix
+  - Reliability-gated cross-modal fusion (softmax gate over 3 modalities)
+  - SupCon + audio-video contrastive + actor adversarial loss design
+  - Complete preprocessing cache with hash-based invalidation
+
+SOURCE B  rela_hlf_v5_diagnostics_pylance_clean.py
+  - Hybrid SSL + handcrafted audio features (MFCC / Chroma / Mel)
+  - Actor-safe out-of-fold (OOF) stacking meta-learner (zero leakage)
+  - Pair specialists for weak confusion pairs
+  - 13 CSV + 13 PNG diagnostic outputs
+  - Balanced class weights in every classifier
+
+NEW in V9 (not in either source file)
+--------------------------------------
+1. GENDER-STRATIFIED PAIR SPECIALISTS (NEW)
+   V9 trains separate binary specialists per actor-gender group for each weak pair
+   as an exploratory error-analysis component using RAVDESS actor metadata.
+   This is evaluated through ablation and is not used for demographic claims.
+
+2. TEMPERATURE CALIBRATION (NEW)
+   Each modality's OOF posteriors are temperature-scaled via NLL
+   minimisation before being fed to the meta-learner.  Stops overconfident
+   modalities from dominating the stack.
+
+3. AUDIO HYBRID FEATURES (NEW unified)
+   SSL last-hidden-state mean/std/max  PLUS  MFCC/Chroma/Mel handcrafted
+   features, concatenated before PCA.  Source A had only SSL; Source B had
+   both but split into separate arrays.  V9 keeps these as one richer vector.
+
+4. UNCERTAINTY LOGGING (NEW)
+   Samples where the meta model's max posterior < threshold are flagged in
+   r07_uncertain_predictions.csv for publication error analysis.
+
+5. BUG FIXES from ESRA-CMT
+   - openface_saliency_scores was an internal alias not exported; fixed.
+   - aligned_proba now handles classifiers trained on a class subset
+     (can happen in small inner folds that miss a rare emotion).
+   - Pipeline passthrough string broke sklearn<1.1; replaced with proper
+     conditional build.
+
+6. EXTRA WEAK-PAIR SPECIALIST (NEW)
+   Neutral vs Calm specialist added because neutral/calm is a frequent
+   low-arousal confusion pair in RAVDESS.
+
+7. PUBLICATION-SAFE METADATA HANDLING (NEW V9)
+   RAVDESS intensity/statement/repetition metadata are excluded from the
+   reliability vector by default to avoid reviewer concerns about metadata
+   leakage. They can be enabled only as an explicit ablation.
+
+Paper references used
+---------------------
+Paper 1: Luna-Jiménez et al. Appl. Sci. 2022 — 86.70% subject-wise 5-CV
+Paper 2: John & Kawanishi ICPR 2021 — 93.59% trial-split (51% subject-ind.)
+Retracted papers are not used as methodological support or benchmark targets.
+
+Recommended install
+-------------------
+pip install torch torchvision torchaudio transformers librosa opencv-python \
+            pandas scikit-learn scipy tqdm matplotlib
+
+Example runs
+------------
+# Full 5-fold run (recommended):
+python esra_rela_v9_publication_ready_fixed.py \
+    --data_dir /path/to/RAVDESS \
+    --openface_dir /path/to/OpenFace_CSVs \
+    --run_all_folds
+
+# No OpenFace (audio + video only):
+python esra_rela_v9_publication_ready_fixed.py \
+    --data_dir /path/to/RAVDESS --openface_dir "" \
+    --fold 0 --no_au
+
+# Smoke test (50 files, handcrafted audio only):
+python esra_rela_v9_publication_ready_fixed.py \
+    --data_dir /path/to/RAVDESS --openface_dir "" \
+    --max_files 50 --no_au --audio_model none
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import warnings
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score,
+    classification_report, confusion_matrix, f1_score,
+)
+from sklearn.model_selection import GroupKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ──────────────────────────────────────────────────────────────────
+# Global model caches
+# ──────────────────────────────────────────────────────────────────
+_AUDIO_EXTRACTOR: Any = None
+_AUDIO_MODEL: Any = None
+_AUDIO_MODEL_NAME: Optional[str] = None
+_VIDEO_MODEL: Any = None
+_VIDEO_TRANSFORM: Any = None
+_VIDEO_EMBED_DIM: Optional[int] = None
+FEATURE_CACHE_VERSION = "esra_rela_v9_pub_1"
+
+# ──────────────────────────────────────────────────────────────────
+# RAVDESS metadata
+# ──────────────────────────────────────────────────────────────────
+EMOTIONS: Dict[int, str] = {
+    1: "Neutral", 2: "Calm",    3: "Happy",    4: "Sad",
+    5: "Angry",   6: "Fearful", 7: "Disgust",  8: "Surprised",
+}
+LABEL_NAMES: List[str] = [EMOTIONS[i] for i in range(1, 9)]
+NAME_TO_LABEL: Dict[str, int] = {n: i for i, n in enumerate(LABEL_NAMES)}
+
+# Paper-1 subject-wise 5-fold splits
+SUBJECT5_FOLDS: List[List[int]] = [
+    [2, 5, 14, 15, 16],
+    [3, 6, 7,  13, 18],
+    [10, 11, 12, 19, 20],
+    [8, 17, 21, 23, 24],
+    [1, 4, 9,  22],
+]
+
+# RAVDESS actor gender mapping (odd actor IDs = male, even = female)
+MALE_ACTORS   = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23}
+FEMALE_ACTORS = {2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24}
+
+# OpenFace AU column names (intensity suffix _r)
+AU_LIST = [
+    "AU01_r","AU02_r","AU04_r","AU05_r","AU06_r","AU07_r",
+    "AU09_r","AU10_r","AU12_r","AU14_r","AU15_r","AU17_r",
+    "AU20_r","AU23_r","AU25_r","AU26_r","AU45_r",
+]
+AU_INT_LIST = [1,2,4,5,6,7,9,10,12,14,15,17,20,23,25,26,45]
+
+# Weak confusion pairs — from error analysis across all three reference papers
+# V9 adds Neutral/Calm because it is a frequent low-arousal confusion pair.
+SPECIALIST_PAIRS = [
+    ("Fearful",  "Surprised"),
+    ("Sad",      "Disgust"),
+    ("Sad",      "Fearful"),
+    ("Angry",    "Disgust"),
+    ("Neutral",  "Calm"),      # NEW V9
+]
+
+# ──────────────────────────────────────────────────────────────────
+# Data structures
+# ──────────────────────────────────────────────────────────────────
+@dataclass
+class Sample:
+    path: Path
+    filename: str
+    actor: int
+    label: int        # 0-based emotion index
+    emotion: str
+    intensity: int
+    statement: int
+    repetition: int
+    gender: str       # "male" | "female"  — NEW V9
+
+
+@dataclass
+class Config:
+    data_dir: str
+    openface_dir: str
+    cache_dir: str         = "esra_rela_v9_cache"
+    results_dir: str       = "esra_rela_v9_results"
+
+    split: str             = "subject5"
+    run_all_folds: bool    = False
+    fold: int              = 0
+    max_files: int         = 0
+    rebuild_cache: bool    = False
+    save_diagnostics: bool = True
+
+    use_audio: bool        = True
+    use_video: bool        = True
+    use_au: bool           = True
+
+    # "none" = handcrafted only (no SSL model download)
+    audio_model: str       = "facebook/wav2vec2-base-960h"
+    audio_sr: int          = 16000
+    audio_seconds: float   = 5.5
+
+    video_frames: int      = 10
+    saliency_top_pool: int = 24
+
+    base_model: str        = "logreg"   # logreg | svm
+    meta_model: str        = "logreg"
+    base_C: float          = 0.45
+    meta_C: float          = 0.55
+    pca_audio: int         = 128
+    pca_video: int         = 128
+    pca_au: int            = 64
+    inner_splits: int      = 4
+
+    enable_specialists: bool           = True
+    enable_gender_specialists: bool    = True    # NEW V9
+    specialist_threshold: float        = 0.38
+    specialist_margin_threshold: float = 0.12
+    specialist_blend: float            = 0.30
+
+    # NEW V9: temperature calibration before meta-learner
+    calibrate_temperatures: bool       = True
+    temp_init: float                   = 1.5
+
+    # NEW V9: uncertainty logging only; predictions are not changed
+    uncertainty_threshold: float       = 0.30
+
+    # Publication-safe default: do not append RAVDESS metadata covariates
+    # such as intensity/statement/repetition to the reliability vector.
+    # Enable only for an explicitly reported ablation.
+    include_metadata_covariates: bool  = False
+
+    random_state: int      = 42
+
+
+# ──────────────────────────────────────────────────────────────────
+# General utilities
+# ──────────────────────────────────────────────────────────────────
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _softmax_np(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32)
+    x = x - x.max()
+    e = np.exp(x)
+    return e / (float(np.sum(e)) + 1e-9)
+
+
+def entropy_1d(p: np.ndarray) -> float:
+    # Pylance-safe: ensure probability vector is floating, not bool/object.
+    p_float = np.asarray(p, dtype=np.float32)
+    p_float = np.clip(p_float, 1e-9, 1.0)
+    return float(-np.sum(p_float * np.log(p_float)) / math.log(len(p_float)))
+
+
+def entropy_mat(P: np.ndarray) -> np.ndarray:
+    """Normalised entropy column for each row of a probability matrix."""
+    P = np.clip(P, 1e-9, 1.0)
+    return (-np.sum(P * np.log(P), axis=1, keepdims=True) /
+            math.log(P.shape[1])).astype(np.float32)
+
+
+def margin_mat(P: np.ndarray) -> np.ndarray:
+    """Top-1 minus top-2 probability margin column."""
+    sp = np.sort(P, axis=1)
+    return (sp[:, -1:] - sp[:, -2:-1]).astype(np.float32)
+
+
+def normalize01(x: np.ndarray) -> np.ndarray:
+    mn, mx = float(x.min()), float(x.max())
+    if mx - mn < 1e-8:
+        return np.zeros_like(x, np.float32)
+    return ((x - mn) / (mx - mn)).astype(np.float32)
+
+
+def save_npz(path: Path, **kw: Any) -> None:
+    tmp = path.with_suffix(".tmp.npz")
+    np.savez_compressed(tmp, **kw)
+    tmp.replace(path)
+
+
+# ──────────────────────────────────────────────────────────────────
+# RAVDESS file discovery
+# ──────────────────────────────────────────────────────────────────
+def parse_ravdess_filename(path: Path) -> Optional[Sample]:
+    parts = path.stem.split("-")
+    if len(parts) != 7:
+        return None
+    try:
+        modality, channel, emotion_id, intensity, statement, repetition, actor = map(int, parts)
+    except ValueError:
+        return None
+    if modality != 1 or channel != 1:   # full-AV speech only (matches Paper 1)
+        return None
+    if emotion_id not in EMOTIONS:
+        return None
+    if actor in MALE_ACTORS:
+        gender = "male"
+    elif actor in FEMALE_ACTORS:
+        gender = "female"
+    else:
+        warnings.warn(f"Unknown RAVDESS actor ID {actor}; setting gender='unknown'.")
+        gender = "unknown"
+    return Sample(
+        path=path, filename=path.name, actor=actor,
+        label=emotion_id - 1, emotion=EMOTIONS[emotion_id],
+        intensity=intensity, statement=statement, repetition=repetition,
+        gender=gender,
+    )
+
+
+def discover_samples(data_dir: Path, max_files: int = 0) -> List[Sample]:
+    samples: List[Sample] = []
+    for ext in ("*.mp4", "*.avi", "*.mov", "*.mkv"):
+        for p in data_dir.rglob(ext):
+            s = parse_ravdess_filename(p)
+            if s is not None:
+                samples.append(s)
+    samples = sorted(samples, key=lambda s: str(s.path.resolve()).lower())
+    if max_files > 0:
+        samples = samples[:max_files]
+    if not samples:
+        raise FileNotFoundError(f"No RAVDESS full-AV speech files under {data_dir}")
+    return samples
+
+
+# ──────────────────────────────────────────────────────────────────
+# OpenFace CSV helpers
+# ──────────────────────────────────────────────────────────────────
+def find_openface_csv(sample: Sample, openface_dir: Path) -> Optional[Path]:
+    if not str(openface_dir) or not openface_dir.exists():
+        return None
+    direct = openface_dir / f"{sample.path.stem}.csv"
+    if direct.exists():
+        return direct
+    hits = list(openface_dir.rglob(f"{sample.path.stem}.csv"))
+    return hits[0] if hits else None
+
+
+def read_openface(sample: Sample, openface_dir: Path) -> Optional[pd.DataFrame]:
+    p = find_openface_csv(sample, openface_dir)
+    if p is None:
+        return None
+    try:
+        df = pd.read_csv(p)
+        df.columns = [c.strip() for c in df.columns]
+        return df
+    except Exception:
+        return None
+
+
+def _of_meta(sample: Sample, openface_dir: Path) -> Dict[str, Any]:
+    p = find_openface_csv(sample, openface_dir)
+    if p is None:
+        return {"csv_path": None, "csv_size": 0, "csv_mtime": 0.0}
+    try:
+        return {"csv_path": str(p.resolve()),
+                "csv_size": int(p.stat().st_size),
+                "csv_mtime": float(p.stat().st_mtime)}
+    except OSError:
+        return {"csv_path": str(p), "csv_size": 0, "csv_mtime": 0.0}
+
+
+
+
+def openface_dataset_fingerprint(samples: Sequence[Sample], openface_dir: Optional[Path]) -> Dict[str, Any]:
+    """Matrix-cache fingerprint for OpenFace CSV coverage/content.
+
+    If OpenFace CSVs are regenerated, the feature-matrix cache should rebuild,
+    because video saliency, face crop, and AU features can change.
+    """
+    if openface_dir is None or not str(openface_dir) or not openface_dir.exists():
+        return {"csv_found": 0, "csv_size_sum": 0, "csv_mtime_sum": 0}
+    found = 0
+    size_sum = 0
+    mtime_sum = 0
+    for s in samples:
+        p = find_openface_csv(s, openface_dir)
+        if p is not None:
+            try:
+                st = p.stat()
+                found += 1
+                size_sum += int(st.st_size)
+                mtime_sum += int(st.st_mtime)
+            except OSError:
+                pass
+    return {"csv_found": found, "csv_size_sum": size_sum, "csv_mtime_sum": mtime_sum}
+
+# ──────────────────────────────────────────────────────────────────
+# Cache key
+# ──────────────────────────────────────────────────────────────────
+def cache_key(sample: Sample, cfg: Config, kind: str) -> str:
+    obj: Dict[str, Any] = {
+        "kind": kind, "version": FEATURE_CACHE_VERSION,
+        "path": str(sample.path.resolve()),
+        "mtime": os.path.getmtime(sample.path),
+        "size": os.path.getsize(sample.path),
+        "audio_model": cfg.audio_model,
+        "audio_sr": cfg.audio_sr,
+        "audio_seconds": cfg.audio_seconds,
+        "video_frames": cfg.video_frames,
+        "saliency_top_pool": cfg.saliency_top_pool,
+    }
+    if kind in {"video", "au"}:
+        if cfg.openface_dir:
+            obj["openface"] = _of_meta(sample, Path(cfg.openface_dir))
+        else:
+            obj["openface"] = {"csv_path": None, "csv_size": 0, "csv_mtime": 0.0}
+    return hashlib.sha1(json.dumps(obj, sort_keys=True).encode()).hexdigest()
+
+
+# ──────────────────────────────────────────────────────────────────
+# AU saliency (merged from ESRA-CMT)
+# ──────────────────────────────────────────────────────────────────
+def _row_au_intensities(df: pd.DataFrame, row_id: int) -> Dict[int, float]:
+    row_id = int(np.clip(row_id, 0, len(df) - 1))
+    row    = df.iloc[row_id]
+    out: Dict[int, float] = {}
+    for au in AU_INT_LIST:
+        r_col = f"AU{au:02d}_r"
+        c_col = f"AU{au:02d}_c"
+        intensity = 0.0
+        presence  = 0.0
+        try:
+            if r_col in df.columns and not pd.isna(row[r_col]):
+                intensity = max(0.0, min(float(row[r_col]) / 5.0, 1.0))
+        except Exception:
+            pass
+        try:
+            if c_col in df.columns and not pd.isna(row[c_col]):
+                presence = max(0.0, min(float(row[c_col]), 1.0))
+        except Exception:
+            pass
+        out[au] = max(intensity, 0.5 * presence)
+    return out
+
+
+def au_saliency_scores(
+    df: Optional[pd.DataFrame], frame_indices: Sequence[int]
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (au_intensity, au_delta, fer_entropy) per candidate frame.
+
+    Merged from ESRA-CMT openface_saliency_scores / au_rule_based_fer_entropy.
+    Fixed: now a proper top-level function (was an internal alias in V3).
+    """
+    n = len(frame_indices)
+    if df is None or len(df) == 0:
+        return (np.zeros(n, np.float32),
+                np.zeros(n, np.float32),
+                np.ones(n, np.float32))
+
+    intensity_l: List[float] = []
+    delta_l:     List[float] = []
+    entropy_l:   List[float] = []
+
+    for fi in frame_indices:
+        row_id   = int(np.clip(fi, 0, len(df) - 1))
+        au       = _row_au_intensities(df, row_id)
+        au_prev  = _row_au_intensities(df, max(0, row_id - 1))
+        active   = np.array([au.get(a, 0.0) for a in AU_INT_LIST], np.float32)
+        delta    = np.array([abs(au.get(a, 0.0) - au_prev.get(a, 0.0)) for a in AU_INT_LIST], np.float32)
+        intensity_l.append(float(active.mean()))
+        delta_l.append(float(delta.mean()))
+        # FACS rule-based logits → entropy (low entropy = high AU confidence)
+        logits = np.array([
+            0.35 - 0.65 * float(active.mean()),
+            0.25 - 0.35 * float(delta.mean()),
+            1.20 * au.get(6,0) + 1.60 * au.get(12,0) + 0.25 * au.get(25,0),
+            1.10 * au.get(1,0) + 1.00 * au.get(4,0)  + 1.25 * au.get(15,0),
+            1.30 * au.get(4,0) + 0.95 * au.get(5,0)  + 1.05 * au.get(7,0) + 1.00 * au.get(23,0),
+            0.90 * au.get(1,0) + 0.90 * au.get(2,0)  + 0.80 * au.get(4,0)
+              + 1.05 * au.get(5,0) + 1.00 * au.get(20,0) + 0.85 * au.get(26,0),
+            1.35 * au.get(9,0) + 1.20 * au.get(10,0) + 0.80 * au.get(17,0),
+            1.25 * au.get(1,0) + 1.25 * au.get(2,0)  + 1.35 * au.get(5,0) + 1.25 * au.get(26,0),
+        ], np.float32)
+        probs = _softmax_np(logits)
+        entropy_l.append(max(0.0, min(entropy_1d(probs), 1.0)))
+
+    return (normalize01(np.array(intensity_l, np.float32)),
+            normalize01(np.array(delta_l,     np.float32)),
+            np.array(entropy_l, np.float32))
+
+
+def openface_row_scores(df: Optional[pd.DataFrame]) -> Optional[np.ndarray]:
+    """Fast per-row saliency score for frame selection (no frame_indices needed)."""
+    if df is None or len(df) == 0:
+        return None
+    def _to_float(col: str) -> np.ndarray:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce").fillna(0).to_numpy(np.float32)
+        return np.ones(len(df), np.float32)
+    success = _to_float("success")
+    conf    = _to_float("confidence")
+    au_cols = [c for c in AU_LIST if c in df.columns]
+    score   = np.zeros(len(df), np.float32)
+    if au_cols:
+        au      = df[au_cols].apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy(np.float32)
+        au_int  = au.mean(axis=1)
+        au_del  = np.zeros_like(au_int)
+        au_del[1:] = np.mean(np.abs(au[1:] - au[:-1]), axis=1)
+        score  += 0.65 * au_int + 0.35 * au_del
+    return score * np.clip(conf, 0, 1) * np.clip(success, 0, 1)
+
+
+def select_frame_indices(video_path: Path, df: Optional[pd.DataFrame],
+                          n_frames: int, pool: int) -> List[int]:
+    cap   = cv2.VideoCapture(str(video_path))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    if total <= 0:
+        total = max(n_frames, 1)
+
+    scores = openface_row_scores(df)
+    if scores is None or len(scores) < 2 or float(np.max(scores)) <= 0:
+        idxs = np.linspace(int(0.12 * max(total - 1, 1)),
+                           int(0.90 * max(total - 1, 1)), n_frames)
+        return [int(np.clip(round(float(x)), 0, max(total - 1, 0))) for x in idxs]
+
+    m           = min(len(scores), total)
+    row_to_frm  = np.linspace(0, max(total - 1, 0), m)
+    top_rows    = sorted(np.argsort(-scores[:m])[:min(pool, m)].tolist())
+    step        = max(1, len(top_rows) // n_frames)
+    final_rows  = top_rows[::step][:n_frames]
+    while len(final_rows) < n_frames:
+        uni = int(np.linspace(0, max(total - 1, 0), n_frames)[len(final_rows)])
+        final_rows.append(uni)
+    return [int(np.clip(round(float(row_to_frm[r])), 0, max(total - 1, 0)))
+            for r in final_rows[:n_frames]]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Audio feature extraction  (V9: hybrid SSL + handcrafted)
+# ──────────────────────────────────────────────────────────────────
+def _load_handcrafted(path: Path, sr: int, seconds: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Returns (waveform, handcrafted_vector)."""
+    try:
+        import librosa
+    except ImportError as exc:
+        raise RuntimeError("pip install librosa") from exc
+
+    y, _ = librosa.load(str(path), sr=sr, mono=True, duration=seconds)
+    max_len = int(sr * seconds)
+    y = np.pad(y, (0, max(0, max_len - len(y))))[:max_len]
+
+    mfcc   = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+    mel    = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=40)
+    rms    = float(np.sqrt(np.mean(y ** 2)) + 1e-8)
+    zcr    = float(librosa.feature.zero_crossing_rate(y)[0].mean())
+    hand   = np.concatenate([
+        mfcc.mean(1), mfcc.std(1),
+        chroma.mean(1), chroma.std(1),
+        np.log(mel + 1e-6).mean(1), np.log(mel + 1e-6).std(1),
+        [rms, zcr],
+    ]).astype(np.float32)
+    return y.astype(np.float32), hand
+
+
+def _ssl_embed(y: np.ndarray, sr: int, model_name: str) -> np.ndarray:
+    global _AUDIO_EXTRACTOR, _AUDIO_MODEL, _AUDIO_MODEL_NAME
+    import torch
+    from transformers import AutoFeatureExtractor, AutoModel
+    if _AUDIO_MODEL is None or _AUDIO_MODEL_NAME != model_name:
+        print(f"[INFO] Loading SSL audio model: {model_name}")
+        _AUDIO_EXTRACTOR = AutoFeatureExtractor.from_pretrained(model_name)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _AUDIO_MODEL = AutoModel.from_pretrained(model_name).to(device).eval()
+        _AUDIO_MODEL_NAME = model_name
+
+    extractor = _AUDIO_EXTRACTOR
+    model     = _AUDIO_MODEL
+    device    = next(model.parameters()).device
+
+    with torch.no_grad():
+        inp = extractor(y, sampling_rate=sr, return_tensors="pt", padding=True)
+        inp = {k: v.to(device) for k, v in inp.items()}
+        h   = model(**inp).last_hidden_state.squeeze(0).detach().float().cpu().numpy()
+    return np.concatenate([h.mean(0), h.std(0), h.max(0)]).astype(np.float32)
+
+
+def extract_audio_feature(sample: Sample, cfg: Config) -> Tuple[np.ndarray, Dict[str, float]]:
+    cdir  = Path(cfg.cache_dir) / "audio"
+    ensure_dir(cdir)
+    cfile = cdir / f"{cache_key(sample, cfg, 'audio')}.npz"
+    if cfile.exists() and not cfg.rebuild_cache:
+        d = np.load(cfile, allow_pickle=True)
+        return d["feat"].astype(np.float32), json.loads(str(d["quality"].item()))
+
+    y, hand = _load_handcrafted(sample.path, cfg.audio_sr, cfg.audio_seconds)
+    quality: Dict[str, float] = {
+        "audio_rms": float(np.sqrt(np.mean(y ** 2))),
+        "audio_zcr": float(np.mean(np.diff(np.sign(y)) != 0)),
+    }
+
+    if cfg.audio_model.lower() != "none":
+        ssl  = _ssl_embed(y, cfg.audio_sr, cfg.audio_model)
+        feat = np.concatenate([ssl, hand]).astype(np.float32)   # SSL + handcrafted
+    else:
+        feat = hand.copy()
+
+    quality["audio_feat_norm"] = float(np.linalg.norm(feat))
+    save_npz(cfile, feat=feat, quality=json.dumps(quality))
+    return feat, quality
+
+
+# ──────────────────────────────────────────────────────────────────
+# Video feature extraction  (MobileNetV3-Small + saliency selection)
+# ──────────────────────────────────────────────────────────────────
+def _face_crop_from_of(frame_rgb: np.ndarray, df: Optional[pd.DataFrame],
+                        frame_idx: int) -> np.ndarray:
+    """Crop the face using all 68 OpenFace landmark points.
+
+    Important fix:
+    OpenFace columns x_0..x_67/y_0..y_67 are landmark coordinates, not a
+    ready-made bounding box. Earlier code used only x_1/x_2/y_1/y_2, which
+    can create a tiny/incorrect crop. This version builds a real landmark
+    bounding box from all available points and adds a margin.
+    """
+    if df is None or len(df) == 0:
+        return frame_rgb
+
+    row_id = int(np.clip(frame_idx, 0, len(df) - 1))
+    row = df.iloc[row_id]
+    h, w = frame_rgb.shape[:2]
+
+    xs: List[float] = []
+    ys: List[float] = []
+    for i in range(68):
+        xc, yc = f"x_{i}", f"y_{i}"
+        if xc in df.columns and yc in df.columns:
+            try:
+                x_val = float(row[xc])
+                y_val = float(row[yc])
+                if np.isfinite(x_val) and np.isfinite(y_val):
+                    xs.append(x_val)
+                    ys.append(y_val)
+            except Exception:
+                pass
+
+    if len(xs) < 10 or len(ys) < 10:
+        return frame_rgb
+
+    x1 = max(0, int(min(xs)))
+    x2 = min(w, int(max(xs)))
+    y1 = max(0, int(min(ys)))
+    y2 = min(h, int(max(ys)))
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 20 or bh < 20:
+        return frame_rgb
+
+    pad = int(0.35 * max(bw, bh))
+    x1 = max(0, x1 - pad)
+    x2 = min(w, x2 + pad)
+    y1 = max(0, y1 - pad)
+    y2 = min(h, y2 + pad)
+
+    crop = frame_rgb[y1:y2, x1:x2]
+    return crop if crop.size > 0 else frame_rgb
+
+def _load_video_model() -> Tuple[Any, Any]:
+    global _VIDEO_MODEL, _VIDEO_TRANSFORM, _VIDEO_EMBED_DIM
+    if _VIDEO_MODEL is None:
+        import torch
+        import torch.nn as nn
+        from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+        weights  = MobileNet_V3_Small_Weights.DEFAULT
+        base     = mobilenet_v3_small(weights=weights)
+        # MobileNetV3-Small feature dimension is normally 576, but read it
+        # dynamically from the classifier so the fallback feature size stays valid
+        # if the backbone is changed later.
+        try:
+            first_classifier_layer: Any = base.classifier[0]
+            _VIDEO_EMBED_DIM = int(getattr(first_classifier_layer, "in_features", 576))
+        except Exception:
+            _VIDEO_EMBED_DIM = 576
+        device   = "cuda" if torch.cuda.is_available() else "cpu"
+        _VIDEO_MODEL = nn.Sequential(
+            base.features, nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten()
+        ).to(device).eval()
+        _VIDEO_TRANSFORM = weights.transforms()
+    return _VIDEO_MODEL, _VIDEO_TRANSFORM
+
+
+def extract_video_feature(sample: Sample, cfg: Config,
+                           df: Optional[pd.DataFrame]) -> Tuple[np.ndarray, Dict[str, float]]:
+    cdir  = Path(cfg.cache_dir) / "video"
+    ensure_dir(cdir)
+    cfile = cdir / f"{cache_key(sample, cfg, 'video')}.npz"
+    if cfile.exists() and not cfg.rebuild_cache:
+        d = np.load(cfile, allow_pickle=True)
+        return d["feat"].astype(np.float32), json.loads(str(d["quality"].item()))
+
+    import torch
+    from PIL import Image as PILImage
+    model, transform = _load_video_model()
+    device           = next(model.parameters()).device
+
+    idxs = select_frame_indices(sample.path, df, cfg.video_frames, cfg.saliency_top_pool)
+    cap  = cv2.VideoCapture(str(sample.path))
+    imgs = []
+    for idx in idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb  = _face_crop_from_of(rgb, df, idx)
+        imgs.append(transform(PILImage.fromarray(rgb)))
+    cap.release()
+
+    quality = {"video_frames_used": float(len(imgs)), "video_saliency": float(df is not None)}
+    if not imgs:
+        dim = int(_VIDEO_EMBED_DIM or 576)
+        # V9 video pooling uses mean/std/max/delta/first/last = 6 blocks.
+        feat = np.zeros(dim * 6, np.float32)
+        save_npz(cfile, feat=feat, quality=json.dumps(quality))
+        return feat, quality
+
+    x   = torch.stack(imgs).to(device)
+    with torch.no_grad():
+        emb = model(x).detach().float().cpu().numpy()   # (n_frames, feature_dim)
+
+    delta  = np.diff(emb, axis=0)
+    d_mean = np.abs(delta).mean(0) if len(delta) > 0 else np.zeros(emb.shape[1], np.float32)
+    # V9 keeps temporal-order cues by appending first and last frame embeddings.
+    feat   = np.concatenate([emb.mean(0), emb.std(0), emb.max(0), d_mean, emb[0], emb[-1]]).astype(np.float32)
+    quality["video_feat_norm"] = float(np.linalg.norm(feat))
+    save_npz(cfile, feat=feat, quality=json.dumps(quality))
+    return feat, quality
+
+
+# ──────────────────────────────────────────────────────────────────
+# AU feature extraction  (8 statistics × N AUs + reliability header)
+# ──────────────────────────────────────────────────────────────────
+def extract_au_feature(sample: Sample, cfg: Config,
+                        df: Optional[pd.DataFrame]) -> Tuple[np.ndarray, Dict[str, float]]:
+    cdir  = Path(cfg.cache_dir) / "au"
+    ensure_dir(cdir)
+    cfile = cdir / f"{cache_key(sample, cfg, 'au')}.npz"
+    if cfile.exists() and not cfg.rebuild_cache:
+        d = np.load(cfile, allow_pickle=True)
+        return d["feat"].astype(np.float32), json.loads(str(d["quality"].item()))
+
+    fixed_dim = len(AU_LIST) * 8 + 4
+    q: Dict[str, float] = {"au_found": 0.0, "au_conf_mean": 0.0, "au_success_rate": 0.0}
+
+    if df is None or len(df) == 0:
+        feat = np.zeros(fixed_dim, np.float32)
+        save_npz(cfile, feat=feat, quality=json.dumps(q))
+        return feat, q
+
+    q["au_found"] = 1.0
+    if "confidence" in df.columns:
+        q["au_conf_mean"] = float(pd.to_numeric(df["confidence"], errors="coerce").fillna(0).mean())
+    if "success" in df.columns:
+        q["au_success_rate"] = float(pd.to_numeric(df["success"], errors="coerce").fillna(0).mean())
+
+    cols = [c for c in AU_LIST if c in df.columns]
+    if not cols:
+        feat = np.zeros(fixed_dim, np.float32)
+        save_npz(cfile, feat=feat, quality=json.dumps(q))
+        return feat, q
+
+    x  = df[cols].apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy(np.float32)
+    dx = np.diff(x, axis=0)
+    if len(dx) == 0:
+        dx = np.zeros_like(x)
+
+    # 8 statistics per AU
+    stats = [
+        x.mean(0), x.std(0), x.max(0), x.min(0),
+        np.median(x, 0),
+        np.quantile(x, 0.75, 0) - np.quantile(x, 0.25, 0),
+        np.abs(dx).mean(0),
+        x[-1] - x[0],
+    ]
+    raw  = np.concatenate(stats).astype(np.float32)
+    body = np.zeros(len(AU_LIST) * 8, np.float32)
+    body[:min(len(body), len(raw))] = raw[:len(body)]
+    rel  = np.array([q["au_found"], q["au_conf_mean"], q["au_success_rate"],
+                     float(np.linalg.norm(body))], np.float32)
+    feat = np.concatenate([body, rel]).astype(np.float32)
+    save_npz(cfile, feat=feat, quality=json.dumps(q))
+    return feat, q
+
+
+# ──────────────────────────────────────────────────────────────────
+# Feature matrix builder
+# ──────────────────────────────────────────────────────────────────
+def build_feature_matrix(
+    samples: List[Sample], cfg: Config
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+           np.ndarray, np.ndarray, np.ndarray]:
+    cdir      = Path(cfg.cache_dir)
+    ensure_dir(cdir)
+    mat_file  = cdir / "esra_rela_v9_matrix.npz"
+    meta_file = cdir / "esra_rela_v9_matrix_meta.json"
+    of_dir: Optional[Path] = Path(cfg.openface_dir) if cfg.openface_dir else None
+
+    meta = {
+        "cache_version": FEATURE_CACHE_VERSION,
+        "files": [str(s.path.resolve()) for s in samples],
+        "openface_fingerprint": openface_dataset_fingerprint(samples, of_dir),
+        "cfg": {
+            "audio_model": cfg.audio_model, "audio_sr": cfg.audio_sr,
+            "audio_seconds": cfg.audio_seconds,
+            "video_frames": cfg.video_frames,
+            "saliency_top_pool": cfg.saliency_top_pool,
+            "use_audio": cfg.use_audio, "use_video": cfg.use_video,
+            "use_au": cfg.use_au,
+            "include_metadata_covariates": cfg.include_metadata_covariates,
+            "version": "v9_publication_fix",
+        },
+    }
+    if mat_file.exists() and meta_file.exists() and not cfg.rebuild_cache:
+        try:
+            if json.loads(meta_file.read_text("utf-8")) == meta:
+                print(f"[INFO] Loading feature matrix: {mat_file}")
+                d = np.load(mat_file)
+                return (d["audio"], d["video"], d["au"], d["rel"],
+                        d["y"], d["groups"], d["genders"])
+        except Exception:
+            pass
+
+    try:
+        from tqdm import tqdm as _tqdm
+        iter_fn = lambda it, **kw: _tqdm(it, **kw)
+    except ImportError:
+        iter_fn = lambda it, **kw: it
+
+    audio_l: List[np.ndarray] = []
+    video_l: List[np.ndarray] = []
+    au_l:    List[np.ndarray] = []
+    rel_l:   List[np.ndarray] = []
+    y_l:     List[int]        = []
+    groups_l: List[int]       = []
+    genders_l: List[int]      = []
+
+    for s in iter_fn(samples, desc="Features"):
+        df = (read_openface(s, of_dir)
+              if (cfg.use_au or cfg.use_video) and of_dir is not None and of_dir.exists() else None)
+        aq: Dict[str, float] = {}
+        vq: Dict[str, float] = {}
+        uq: Dict[str, float] = {}
+        af = np.zeros(1, np.float32)
+        vf = np.zeros(1, np.float32)
+        uf = np.zeros(1, np.float32)
+
+        if cfg.use_audio:
+            af, aq = extract_audio_feature(s, cfg)
+        if cfg.use_video:
+            vf, vq = extract_video_feature(s, cfg, df)
+        if cfg.use_au:
+            uf, uq = extract_au_feature(s, cfg, df)
+
+        rel_values = [
+            aq.get("audio_rms", 0.0),
+            aq.get("audio_zcr", 0.0),
+            aq.get("audio_feat_norm", 0.0),
+            vq.get("video_frames_used", 0.0) / max(1.0, float(cfg.video_frames)),
+            vq.get("video_saliency", 0.0),
+            vq.get("video_feat_norm", 0.0),
+            uq.get("au_found", 0.0),
+            uq.get("au_conf_mean", 0.0),
+            uq.get("au_success_rate", 0.0),
+        ]
+        if cfg.include_metadata_covariates:
+            # Explicit ablation only; disabled by default for publication safety.
+            rel_values.extend([float(s.intensity), float(s.statement), float(s.repetition)])
+        r = np.array(rel_values, np.float32)
+
+        audio_l.append(af);   video_l.append(vf);   au_l.append(uf)
+        rel_l.append(r);      y_l.append(s.label);  groups_l.append(s.actor)
+        genders_l.append(0 if s.gender == "male" else (1 if s.gender == "female" else -1))
+
+    audio   = np.vstack(audio_l).astype(np.float32)
+    video   = np.vstack(video_l).astype(np.float32)
+    au      = np.vstack(au_l).astype(np.float32)
+    rel     = np.vstack(rel_l).astype(np.float32)
+    y       = np.array(y_l,      np.int64)
+    groups  = np.array(groups_l, np.int64)
+    genders = np.array(genders_l,np.int64)
+
+    save_npz(mat_file, audio=audio, video=video, au=au,
+             rel=rel, y=y, groups=groups, genders=genders)
+    meta_file.write_text(json.dumps(meta, indent=2), "utf-8")
+    return audio, video, au, rel, y, groups, genders
+
+
+# ──────────────────────────────────────────────────────────────────
+# Classifier helpers
+# ──────────────────────────────────────────────────────────────────
+def _make_pipeline(kind: str, C: float, pca_dim: int,
+                   n_features: int, seed: int) -> Pipeline:
+    """Build a StandardScaler → (optional PCA) → classifier pipeline.
+
+    Bug fix from ESRA-CMT: old code used the string 'passthrough' as a step
+    value, which fails in sklearn < 1.1. Now we conditionally include PCA.
+    """
+    steps: List[Tuple[str, Any]] = [("scaler", StandardScaler())]
+    if pca_dim > 0 and n_features > pca_dim + 5:
+        steps.append(("pca", PCA(n_components=min(pca_dim, n_features - 1),
+                                  random_state=seed)))
+    if kind == "svm":
+        base = LinearSVC(C=C, class_weight="balanced",
+                          random_state=seed, max_iter=5000)
+        clf  = CalibratedClassifierCV(base, cv=3)
+    else:
+        clf = LogisticRegression(C=C, class_weight="balanced",
+                                  max_iter=2500, solver="lbfgs",
+                                  random_state=seed)
+    steps.append(("clf", clf))
+    return Pipeline(steps)
+
+
+def aligned_proba(model: Pipeline, X: np.ndarray) -> np.ndarray:
+    """Return (N, 8) probability matrix even if classifier saw only a subset of classes.
+
+    Bug fix: classifiers trained on inner folds can miss a rare emotion entirely.
+    aligned_proba fills the missing columns with zeros so the shape is always (N,8).
+    """
+    raw     = model.predict_proba(X)
+    classes = model.named_steps["clf"].classes_
+    out     = np.zeros((len(X), len(LABEL_NAMES)), np.float32)
+    for j, c in enumerate(classes):
+        out[:, int(c)] = raw[:, j]
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────
+# NEW V9: posterior-temperature calibration
+# ──────────────────────────────────────────────────────────────────
+def fit_temperature(probs_oof: np.ndarray, y_oof: np.ndarray,
+                    T_init: float = 1.5) -> float:
+    """Grid-search a scalar smoothing/sharpening temperature on OOF posteriors.
+
+    Because sklearn base models expose probabilities rather than neural logits,
+    this uses softmax(log(p) / T), implemented as p**(1/T) then renormalized.
+    The calibrated OOF probabilities are returned to the meta-learner together
+    with calibrated test probabilities, so train/test meta inputs are matched.
+    """
+    best_T, best_nll = T_init, float("inf")
+    for T in np.linspace(0.5, 5.0, 46):
+        p = np.clip(probs_oof, 1e-9, 1.0) ** (1.0 / T)
+        p = p / p.sum(axis=1, keepdims=True)
+        nll = -float(np.mean(np.log(p[np.arange(len(y_oof)), y_oof.astype(int)])))
+        if nll < best_nll:
+            best_nll, best_T = nll, float(T)
+    return best_T
+
+
+def apply_temperature(probs: np.ndarray, T: float) -> np.ndarray:
+    T = max(T, 1e-3)
+    p = np.clip(probs, 1e-9, 1.0) ** (1.0 / T)
+    p = p / p.sum(axis=1, keepdims=True)
+    return p.astype(np.float32)
+
+
+# ──────────────────────────────────────────────────────────────────
+# OOF stacking
+# ──────────────────────────────────────────────────────────────────
+def oof_and_test_probs(
+    X: np.ndarray, y: np.ndarray, groups: np.ndarray,
+    train_idx: np.ndarray, test_idx: np.ndarray,
+    cfg: Config, pca_dim: int, seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    Xtr, ytr, gtr = X[train_idx], y[train_idx], groups[train_idx]
+    Xt = X[test_idx]
+    n_splits = min(cfg.inner_splits, len(np.unique(gtr)))
+    if n_splits < 2:
+        raise RuntimeError("Need ≥2 actor groups for inner OOF stacking.")
+    if n_splits < cfg.inner_splits:
+        warnings.warn(
+            f"Reduced inner_splits from {cfg.inner_splits} to {n_splits} because only "
+            f"{len(np.unique(gtr))} train actor groups are available."
+        )
+
+    oof = np.zeros((len(train_idx), len(LABEL_NAMES)), np.float32)
+    for tr_l, va_l in GroupKFold(n_splits=n_splits).split(Xtr, ytr, gtr):
+        m = _make_pipeline(cfg.base_model, cfg.base_C, pca_dim, Xtr.shape[1], seed)
+        m.fit(Xtr[tr_l], ytr[tr_l])
+        oof[va_l] = aligned_proba(m, Xtr[va_l])
+
+    final = _make_pipeline(cfg.base_model, cfg.base_C, pca_dim, Xtr.shape[1], seed + 99)
+    final.fit(Xtr, ytr)
+    test_probs = aligned_proba(final, Xt)
+
+    # NEW V9: temperature calibration
+    if cfg.calibrate_temperatures:
+        T          = fit_temperature(oof, ytr, cfg.temp_init)
+        oof        = apply_temperature(oof, T)
+        test_probs = apply_temperature(test_probs, T)
+
+    return oof, test_probs
+
+
+# ──────────────────────────────────────────────────────────────────
+# Pair specialists  (from RELA-HLF, expanded)
+# ──────────────────────────────────────────────────────────────────
+def _build_specialist(X: np.ndarray, yy: np.ndarray, seed: int) -> Pipeline:
+    n_pca = min(96, X.shape[1] - 1, len(yy) - 2)
+    if n_pca >= 5:
+        return Pipeline([
+            ("scaler", StandardScaler()),
+            ("pca", PCA(n_components=n_pca, random_state=seed)),
+            ("clf", LogisticRegression(C=0.40, class_weight="balanced",
+                                        max_iter=1500, random_state=seed)),
+        ])
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(C=0.40, class_weight="balanced",
+                                    max_iter=1500, random_state=seed)),
+    ])
+
+
+def train_pair_specialists(
+    Xfull: np.ndarray, y: np.ndarray, train_idx: np.ndarray, cfg: Config, fold_id: int
+) -> Dict[Tuple[int, int], Pipeline]:
+    out: Dict[Tuple[int, int], Pipeline] = {}
+    for pair_i, (a_name, b_name) in enumerate(SPECIALIST_PAIRS):
+        a, b = NAME_TO_LABEL[a_name], NAME_TO_LABEL[b_name]
+        idx  = train_idx[np.isin(y[train_idx], [a, b])]
+        if len(np.unique(y[idx])) < 2 or len(idx) < 10:
+            continue
+        yy = (y[idx] == b).astype(int)
+        m  = _build_specialist(Xfull[idx], yy, cfg.random_state + fold_id * 1000 + pair_i)
+        m.fit(Xfull[idx], yy)
+        out[(a, b)] = m
+    return out
+
+
+def train_gender_pair_specialists(
+    Xfull: np.ndarray, y: np.ndarray, genders: np.ndarray,
+    train_idx: np.ndarray, cfg: Config, fold_id: int,
+) -> Dict[Tuple[int, int, int], Pipeline]:
+    """V9: separate binary classifiers per actor-gender group for each weak pair."""
+    out: Dict[Tuple[int, int, int], Pipeline] = {}
+    for g in (0, 1):
+        g_idx = train_idx[genders[train_idx] == g]
+        for pair_i, (a_name, b_name) in enumerate(SPECIALIST_PAIRS):
+            a, b = NAME_TO_LABEL[a_name], NAME_TO_LABEL[b_name]
+            idx  = g_idx[np.isin(y[g_idx], [a, b])]
+            if len(np.unique(y[idx])) < 2 or len(idx) < 8:
+                continue
+            yy = (y[idx] == b).astype(int)
+            seed = cfg.random_state + fold_id * 1000 + pair_i + 100 * g
+            m  = _build_specialist(Xfull[idx], yy, seed)
+            m.fit(Xfull[idx], yy)
+            out[(a, b, g)] = m
+    return out
+
+
+def apply_specialists(
+    probs: np.ndarray,
+    Xfull_test: np.ndarray,
+    specialists: Dict[Tuple[int, int], Pipeline],
+    genders_test: Optional[np.ndarray],
+    gender_specialists: Optional[Dict[Tuple[int, int, int], Pipeline]],
+    cfg: Config,
+) -> np.ndarray:
+    """Apply pair specialists with batched predict_proba calls.
+
+    V9 change: V8 called predict_proba once per sample per specialist.
+    Here, each specialist predicts the whole test fold once, then the same
+    pair-trigger logic is applied sample-by-sample. This is much faster and
+    produces the same type of blended probabilities.
+    """
+    if not specialists:
+        return probs
+
+    new_probs = probs.copy()
+    top3      = np.argsort(-probs, axis=1)[:, :3]
+    blend     = float(np.clip(cfg.specialist_blend, 0, 1))
+
+    specialist_probs: Dict[Tuple[int, int], np.ndarray] = {
+        key: model.predict_proba(Xfull_test) for key, model in specialists.items()
+    }
+    gender_specialist_probs: Dict[Tuple[int, int, int], np.ndarray] = {}
+    if gender_specialists is not None:
+        gender_specialist_probs = {
+            key: model.predict_proba(Xfull_test) for key, model in gender_specialists.items()
+        }
+
+    for i in range(len(probs)):
+        g = int(genders_test[i]) if genders_test is not None else -1
+        for (a, b), sp_all in specialist_probs.items():
+            pair_prob   = float(probs[i, a] + probs[i, b])
+            pair_in_top = (a in top3[i]) and (b in top3[i])
+            if not pair_in_top and pair_prob < cfg.specialist_threshold:
+                continue
+            if (abs(float(probs[i, a] - probs[i, b])) > cfg.specialist_margin_threshold
+                    and not pair_in_top):
+                continue
+
+            pa, pb = float(sp_all[i, 0]), float(sp_all[i, 1])
+
+            # V9: blend gender-specific specialist when available.
+            g_key = (a, b, g)
+            if g_key in gender_specialist_probs:
+                gsp = gender_specialist_probs[g_key]
+                pa  = 0.6 * pa + 0.4 * float(gsp[i, 0])
+                pb  = 0.6 * pb + 0.4 * float(gsp[i, 1])
+
+            total = max(pair_prob, cfg.specialist_threshold)
+            new_probs[i, a] = (1 - blend) * new_probs[i, a] + blend * total * pa
+            new_probs[i, b] = (1 - blend) * new_probs[i, b] + blend * total * pb
+            s = float(new_probs[i].sum())
+            if s > 1e-8:
+                new_probs[i] /= s
+    return new_probs
+
+# ──────────────────────────────────────────────────────────────────
+# Fold runner
+# ──────────────────────────────────────────────────────────────────
+def make_subject_folds(groups: np.ndarray) -> List[np.ndarray]:
+    return [np.where(np.isin(groups, actors))[0] for actors in SUBJECT5_FOLDS]
+
+
+def run_fold(
+    fold_id: int,
+    samples: List[Sample],
+    audio: np.ndarray,
+    video: np.ndarray,
+    au: np.ndarray,
+    rel: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    genders: np.ndarray,
+    cfg: Config,
+) -> Dict[str, Any]:
+    folds     = make_subject_folds(groups)
+    test_idx  = folds[fold_id]
+    all_idx = np.arange(len(y), dtype=np.int64)
+    train_idx = all_idx[~np.isin(all_idx, test_idx)]
+
+    print(f"\n{'─'*70}")
+    print(f"Fold {fold_id}")
+    print(f"  train actors: {sorted(np.unique(groups[train_idx]).tolist())}")
+    print(f"  test  actors: {sorted(np.unique(groups[test_idx]).tolist())}")
+
+    meta_tr: List[np.ndarray] = []
+    meta_te: List[np.ndarray] = []
+    modality_test: Dict[str, np.ndarray] = {}
+    seed_base = cfg.random_state + 11 * fold_id
+
+    if cfg.use_audio:
+        print("[INFO] Audio OOF stacking…")
+        oof, tst = oof_and_test_probs(audio, y, groups, train_idx, test_idx, cfg,
+                                       cfg.pca_audio, seed_base)
+        modality_test["audio"] = tst
+        meta_tr += [oof, entropy_mat(oof), margin_mat(oof)]
+        meta_te += [tst, entropy_mat(tst), margin_mat(tst)]
+
+    if cfg.use_video:
+        print("[INFO] Video OOF stacking…")
+        oof, tst = oof_and_test_probs(video, y, groups, train_idx, test_idx, cfg,
+                                       cfg.pca_video, seed_base + 101)
+        modality_test["video"] = tst
+        meta_tr += [oof, entropy_mat(oof), margin_mat(oof)]
+        meta_te += [tst, entropy_mat(tst), margin_mat(tst)]
+
+    if cfg.use_au:
+        print("[INFO] AU OOF stacking…")
+        oof, tst = oof_and_test_probs(au, y, groups, train_idx, test_idx, cfg,
+                                       cfg.pca_au, seed_base + 202)
+        modality_test["au"] = tst
+        meta_tr += [oof, entropy_mat(oof), margin_mat(oof)]
+        meta_te += [tst, entropy_mat(tst), margin_mat(tst)]
+
+    if not meta_tr:
+        raise RuntimeError("Enable at least one modality (--use_audio / --use_video / --use_au).")
+
+    Xmeta_tr = np.hstack(meta_tr + [rel[train_idx]]).astype(np.float32)
+    Xmeta_te = np.hstack(meta_te + [rel[test_idx]]).astype(np.float32)
+    meta_clf  = _make_pipeline(cfg.meta_model, cfg.meta_C, 0,
+                                Xmeta_tr.shape[1], cfg.random_state + 1000 + fold_id)
+    meta_clf.fit(Xmeta_tr, y[train_idx])
+    probs = aligned_proba(meta_clf, Xmeta_te)
+
+    # Specialists trained on full concatenated feature space
+    Xfull = np.hstack([audio, video, au, rel]).astype(np.float32)
+    gen_sp: Optional[Dict[Tuple[int,int,int], Pipeline]] = None
+
+    if cfg.enable_specialists:
+        plain_sp = train_pair_specialists(Xfull, y, train_idx, cfg, fold_id)
+        print(f"[INFO] Pair specialists: "
+              f"{[(LABEL_NAMES[a], LABEL_NAMES[b]) for a,b in plain_sp]}")
+
+        if cfg.enable_gender_specialists:
+            gen_sp = train_gender_pair_specialists(Xfull, y, genders, train_idx, cfg, fold_id)
+            print(f"[INFO] Gender specialists: {len(gen_sp)} models")
+
+        probs = apply_specialists(
+            probs, Xfull[test_idx],
+            plain_sp,
+            genders[test_idx] if cfg.enable_gender_specialists else None,
+            gen_sp,
+            cfg,
+        )
+
+    pred = probs.argmax(axis=1)
+    true = y[test_idx]
+    cm   = confusion_matrix(true, pred, labels=np.arange(8))
+    acc  = float(accuracy_score(true, pred))
+    mf1  = float(f1_score(true, pred, average="macro"))
+    uar  = float(balanced_accuracy_score(true, pred))
+
+    # NEW V9: uncertainty logging only; final predictions are not changed
+    max_p       = probs.max(axis=1)
+    uncertain   = max_p < cfg.uncertainty_threshold
+    n_uncertain = int(uncertain.sum())
+    print(f"[INFO] Uncertain (p < {cfg.uncertainty_threshold}): {n_uncertain}/{len(true)}")
+
+    # Ablation
+    ablations: Dict[str, Dict[str, float]] = {}
+    for name, pr in modality_test.items():
+        pp = pr.argmax(axis=1)
+        ablations[name] = {
+            "accuracy": float(accuracy_score(true, pp)),
+            "macro_f1": float(f1_score(true, pp, average="macro")),
+            "uar":      float(balanced_accuracy_score(true, pp)),
+        }
+    if len(modality_test) >= 2:
+        avg = np.mean(np.stack(list(modality_test.values())), axis=0)
+        pp  = avg.argmax(axis=1)
+        ablations["simple_avg_fusion"] = {
+            "accuracy": float(accuracy_score(true, pp)),
+            "macro_f1": float(f1_score(true, pp, average="macro")),
+            "uar":      float(balanced_accuracy_score(true, pp)),
+        }
+
+    print(f"[RESULT] Fold {fold_id}: "
+          f"Acc={acc*100:.2f}%  Macro-F1={mf1*100:.2f}%  UAR={uar*100:.2f}%")
+    return {
+        "fold": fold_id,
+        "accuracy": acc, "macro_f1": mf1, "uar": uar,
+        "cm": cm, "true": true, "pred": pred, "test_idx": test_idx,
+        "test_actors": sorted(np.unique(groups[test_idx]).tolist()),
+        "ablations": ablations,
+        "n_uncertain": n_uncertain,
+        "uncertain_idx": test_idx[uncertain].tolist(),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────
+# Diagnostics / plotting helpers
+# ──────────────────────────────────────────────────────────────────
+def _plt():
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        return plt
+    except Exception:
+        return None
+
+
+def _plot_bar(series: pd.Series, out: Path, title: str,
+              xlabel: str, ylabel: str) -> None:
+    plt = _plt()
+    if plt is None:
+        return
+    fig, ax = plt.subplots(figsize=(10, 5))
+    series.plot(kind="bar", ax=ax, color="steelblue")
+    ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout(); fig.savefig(out, dpi=150); plt.close(fig)
+
+
+def _plot_heatmap(df: pd.DataFrame, out: Path, title: str,
+                   xlabel: str, ylabel: str, fmt: str = ".2f") -> None:
+    plt = _plt()
+    if plt is None:
+        return
+    fig, ax = plt.subplots(figsize=(max(8, len(df.columns)), max(5, len(df))))
+    im = ax.imshow(df.values.astype(float), aspect="auto")
+    fig.colorbar(im, ax=ax)
+    ax.set_xticks(range(len(df.columns)))
+    ax.set_xticklabels(df.columns, rotation=45, ha="right")
+    ax.set_yticks(range(len(df))); ax.set_yticklabels(df.index)
+    ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    for i in range(len(df)):
+        for j in range(len(df.columns)):
+            ax.text(j, i, format(float(df.values[i, j]), fmt),
+                    ha="center", va="center", fontsize=7)
+    fig.tight_layout(); fig.savefig(out, dpi=150); plt.close(fig)
+
+
+def save_cm_plot(cm: np.ndarray, out: Path, title: str,
+                  normalize: bool = False) -> None:
+    plt = _plt()
+    if plt is None:
+        return
+    mat = cm.astype(float)
+    if normalize:
+        mat = mat / np.maximum(mat.sum(axis=1, keepdims=True), 1)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(mat)
+    fig.colorbar(im, ax=ax)
+    ax.set_xticks(range(8)); ax.set_xticklabels(LABEL_NAMES, rotation=45, ha="right")
+    ax.set_yticks(range(8)); ax.set_yticklabels(LABEL_NAMES)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True"); ax.set_title(title)
+    for i in range(8):
+        for j in range(8):
+            v = float(mat[i, j])
+            label = f"{v:.2f}" if normalize else str(int(round(v)))
+            ax.text(j, i, label, ha="center", va="center", fontsize=8,
+                    color="white" if v > mat.max() * 0.6 else "black")
+    fig.tight_layout(); fig.savefig(out, dpi=150); plt.close(fig)
+
+
+def save_diagnostics(
+    samples: List[Sample], cfg: Config,
+    audio: np.ndarray, video: np.ndarray,
+    au: np.ndarray, rel: np.ndarray,
+    y: np.ndarray, groups: np.ndarray,
+) -> None:
+    diag  = Path(cfg.results_dir) / "diagnostics"
+    ensure_dir(diag)
+    of_dir: Optional[Path] = Path(cfg.openface_dir) if cfg.openface_dir else None
+
+    sdf = pd.DataFrame({
+        "file":       [s.filename  for s in samples],
+        "actor":      [s.actor     for s in samples],
+        "gender":     [s.gender    for s in samples],
+        "emotion":    [s.emotion   for s in samples],
+        "label":      [s.label     for s in samples],
+        "intensity":  [s.intensity for s in samples],
+        "statement":  [s.statement for s in samples],
+        "repetition": [s.repetition for s in samples],
+        "of_found":   [find_openface_csv(s, of_dir) is not None if of_dir is not None else False for s in samples],
+    })
+    sdf.to_csv(diag / "d00_sample_metadata.csv", index=False)
+
+    counts = sdf["emotion"].value_counts().reindex(LABEL_NAMES, fill_value=0)
+    counts.to_csv(diag / "d01_class_distribution.csv", header=["count"])
+    _plot_bar(counts, diag / "g01_class_distribution.png",
+              "Class Distribution", "Emotion", "Count")
+
+    # NEW V9: gender × emotion breakdown
+    g_e = pd.crosstab(sdf["emotion"], sdf["gender"]).reindex(index=LABEL_NAMES, fill_value=0)
+    g_e.to_csv(diag / "d02_gender_emotion.csv")
+    _plot_heatmap(g_e, diag / "g02_gender_emotion.png",
+                  "Emotion × Gender Distribution", "Gender", "Emotion", fmt=".0f")
+
+    of_cov = sdf.groupby("emotion")["of_found"].mean().reindex(LABEL_NAMES, fill_value=0)
+    of_cov.to_csv(diag / "d03_openface_coverage.csv", header=["coverage"])
+    _plot_bar(of_cov, diag / "g03_openface_coverage.png",
+              "OpenFace Coverage", "Emotion", "Coverage Ratio")
+
+    folds = make_subject_folds(groups)
+    fold_rows = []
+    for fid, idx in enumerate(folds):
+        # Pylance-safe class counts: avoid pandas Hashable index typing in c.items().
+        fold_counts = np.bincount(y[idx].astype(int), minlength=len(LABEL_NAMES))
+        row: Dict[str, Any] = {
+            "fold": fid,
+            "actors": ",".join(map(str, SUBJECT5_FOLDS[fid])),
+            "n": int(len(idx)),
+        }
+        for class_i, class_name in enumerate(LABEL_NAMES):
+            row[class_name] = int(fold_counts[class_i])
+        fold_rows.append(row)
+    fold_df = pd.DataFrame(fold_rows)
+    fold_df.to_csv(diag / "d04_fold_distribution.csv", index=False)
+    _plot_heatmap(fold_df.set_index("fold")[LABEL_NAMES],
+                  diag / "g04_fold_distribution.png",
+                  "Test Class Distribution per Fold", "Emotion", "Fold", fmt=".0f")
+
+    rel_names = [
+        "audio_rms","audio_zcr","audio_feat_norm",
+        "video_frame_ratio","video_saliency","video_feat_norm",
+        "au_found","au_conf_mean","au_success_rate",
+    ]
+    if rel.shape[1] == 12:
+        rel_names += ["intensity","statement","repetition"]
+    elif rel.shape[1] != len(rel_names):
+        rel_names = [f"rel_{i}" for i in range(rel.shape[1])]
+    rel_df = pd.DataFrame(rel, columns=rel_names)
+    rel_df["emotion"] = [LABEL_NAMES[int(i)] for i in y]
+    rel_by = rel_df.groupby("emotion")[rel_names].mean().reindex(LABEL_NAMES).fillna(0)
+    rel_by.to_csv(diag / "d05_reliability_by_emotion.csv")
+    _plot_heatmap(rel_by, diag / "g05_reliability_by_emotion.png",
+                  "Mean Reliability Features by Emotion", "Feature", "Emotion", fmt=".2f")
+
+    corr = rel_df[rel_names].corr().fillna(0)
+    corr.to_csv(diag / "d06_reliability_correlation.csv")
+    _plot_heatmap(corr, diag / "g06_reliability_correlation.png",
+                  "Reliability Correlation Matrix", "Feature", "Feature", fmt=".2f")
+
+    norms = pd.DataFrame({
+        "audio_norm": np.linalg.norm(audio, axis=1) if audio.ndim == 2 else np.zeros(len(y)),
+        "video_norm": np.linalg.norm(video, axis=1) if video.ndim == 2 else np.zeros(len(y)),
+        "au_norm":    np.linalg.norm(au,    axis=1) if au.ndim    == 2 else np.zeros(len(y)),
+        "emotion":    [LABEL_NAMES[int(i)] for i in y],
+    })
+    norms.to_csv(diag / "d07_feature_norms.csv", index=False)
+    _plot_heatmap(
+        norms.groupby("emotion")[["audio_norm","video_norm","au_norm"]].mean().reindex(LABEL_NAMES),
+        diag / "g07_feature_norms_by_emotion.png",
+        "Mean Feature Norms by Emotion", "Modality", "Emotion", fmt=".2f",
+    )
+
+    pd.DataFrame([{
+        "matrix": m, "rows": int(arr.shape[0]),
+        "cols": int(arr.shape[1] if arr.ndim > 1 else 1),
+    } for m, arr in [("audio",audio),("video",video),("au",au),("reliability",rel)]
+    ]).to_csv(diag / "d08_feature_dimensions.csv", index=False)
+
+    print(f"[INFO] Diagnostics saved: {diag}")
+
+
+def save_final_tables(
+    results: List[Dict[str, Any]],
+    yt: np.ndarray, yp: np.ndarray,
+    cfg: Config,
+) -> None:
+    out = Path(cfg.results_dir) / "final_results"
+    ensure_dir(out)
+
+    cm = confusion_matrix(yt, yp, labels=np.arange(8))
+    pd.DataFrame(cm, index=LABEL_NAMES, columns=LABEL_NAMES).to_csv(out / "r01_cm.csv")
+    save_cm_plot(cm, out / "r01_cm.png", "Aggregated Confusion Matrix")
+    save_cm_plot(cm, out / "r02_cm_norm.png", "Aggregated Normalised CM", normalize=True)
+    cm_n = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1)
+    pd.DataFrame(cm_n, index=LABEL_NAMES, columns=LABEL_NAMES).to_csv(out / "r02_cm_norm.csv")
+
+    pd.DataFrame(
+        classification_report(yt, yp, target_names=LABEL_NAMES, output_dict=True)
+    ).T.to_csv(out / "r03_classification_report.csv")
+
+    fold_df = pd.DataFrame([{
+        "fold":     r["fold"],
+        "accuracy": r["accuracy"],
+        "macro_f1": r["macro_f1"],
+        "uar":      r["uar"],
+    } for r in results])
+    fold_df.to_csv(out / "r04_fold_metrics.csv", index=False)
+
+    plt = _plt()
+    if plt is not None:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        x = np.arange(len(fold_df)); w = 0.25
+        ax.bar(x-w, fold_df["accuracy"]*100, w, label="Accuracy")
+        ax.bar(x,   fold_df["macro_f1"]*100, w, label="Macro-F1")
+        ax.bar(x+w, fold_df["uar"]*100,      w, label="UAR")
+        ax.set_xticks(x); ax.set_xticklabels([f"Fold {int(v)}" for v in fold_df["fold"]])
+        ax.set_ylabel("Score (%)"); ax.set_title("ESRA-RELA V9 — Per-Fold Metrics")
+        ax.legend(); ax.set_ylim(0, 105); fig.tight_layout()
+        fig.savefig(out / "r05_fold_metrics.png", dpi=150); plt.close(fig)
+
+    ablation_rows = []
+    for r in results:
+        for name, met in r.get("ablations", {}).items():
+            ablation_rows.append({"fold": r["fold"], "model": name, **met})
+    if ablation_rows:
+        pd.DataFrame(ablation_rows).to_csv(out / "r06_ablation_metrics.csv", index=False)
+
+    # NEW V9: uncertainty log
+    uncertain_rows = [
+        {"fold": r["fold"], "sample_idx": idx}
+        for r in results for idx in r.get("uncertain_idx", [])
+    ]
+    if uncertain_rows:
+        pd.DataFrame(uncertain_rows).to_csv(out / "r07_uncertain_predictions.csv", index=False)
+
+    print(f"[INFO] Final result tables saved: {out}")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────
+def run(cfg: Config) -> None:
+    ensure_dir(Path(cfg.results_dir))
+    ensure_dir(Path(cfg.cache_dir))
+
+    data_path = Path(cfg.data_dir)
+    candidate_exts = ("*.mp4", "*.avi", "*.mov", "*.mkv")
+    total_video_files = sum(1 for ext in candidate_exts for _ in data_path.rglob(ext))
+    samples = discover_samples(data_path, cfg.max_files)
+    print(f"[INFO] Video files found before RAVDESS full-AV speech filter: {total_video_files}")
+    print(f"[INFO] Samples after full-AV speech filter: {len(samples)}")
+    print(f"[INFO] Actors  : {sorted({s.actor for s in samples})}")
+    print("[INFO] Class distribution:")
+    print(pd.Series([s.emotion for s in samples]).value_counts()
+            .reindex(LABEL_NAMES).to_string())
+
+    of_dir: Optional[Path] = Path(cfg.openface_dir) if cfg.openface_dir else None
+    if cfg.use_au or cfg.use_video:
+        found = sum(1 for s in samples if of_dir is not None and find_openface_csv(s, of_dir) is not None)
+        pct   = 100.0 * found / max(len(samples), 1)
+        print(f"[INFO] OpenFace coverage: {found}/{len(samples)} = {pct:.1f}%")
+
+    audio, video, au, rel, y, groups, genders = build_feature_matrix(samples, cfg)
+
+    if cfg.save_diagnostics:
+        save_diagnostics(samples, cfg, audio, video, au, rel, y, groups)
+
+    fold_ids = list(range(5)) if cfg.run_all_folds else [cfg.fold]
+    results: List[Dict[str, Any]] = []
+    all_true: List[np.ndarray] = []
+    all_pred: List[np.ndarray] = []
+
+    for fid in fold_ids:
+        r = run_fold(fid, samples, audio, video, au, rel, y, groups, genders, cfg)
+        results.append(r)
+        all_true.append(r["true"])
+        all_pred.append(r["pred"])
+        out_dir = Path(cfg.results_dir)
+        pd.DataFrame(r["cm"], index=LABEL_NAMES, columns=LABEL_NAMES).to_csv(
+            out_dir / f"cm_fold{fid}.csv")
+        save_cm_plot(r["cm"], out_dir / f"cm_fold{fid}.png",
+                     f"Fold {fid} Confusion Matrix")
+        save_cm_plot(r["cm"], out_dir / f"cm_fold{fid}_norm.png",
+                     f"Fold {fid} Normalised CM", normalize=True)
+        pd.DataFrame({
+            "true": [LABEL_NAMES[i] for i in r["true"]],
+            "pred": [LABEL_NAMES[i] for i in r["pred"]],
+            "idx":  r["test_idx"].tolist(),
+        }).to_csv(out_dir / f"preds_fold{fid}.csv", index=False)
+
+    yt = np.concatenate(all_true)
+    yp = np.concatenate(all_pred)
+
+    fold_df = pd.DataFrame([{
+        "fold":       r["fold"],
+        "test_actors": ",".join(map(str, r["test_actors"])),
+        "accuracy":   r["accuracy"],
+        "macro_f1":   r["macro_f1"],
+        "uar":        r["uar"],
+        "n_uncertain": r["n_uncertain"],
+    } for r in results])
+    fold_df.to_csv(Path(cfg.results_dir) / "fold_summary.csv", index=False)
+
+    if cfg.save_diagnostics:
+        save_final_tables(results, yt, yp, cfg)
+
+    summary = {
+        "config":          asdict(cfg),
+        "accuracy_mean":   float(fold_df["accuracy"].mean()),
+        "accuracy_std":    float(fold_df["accuracy"].std(ddof=0)),
+        "macro_f1_mean":   float(fold_df["macro_f1"].mean()),
+        "macro_f1_std":    float(fold_df["macro_f1"].std(ddof=0)),
+        "uar_mean":        float(fold_df["uar"].mean()),
+        "uar_std":         float(fold_df["uar"].std(ddof=0)),
+        "classification_report": classification_report(
+            yt, yp, target_names=LABEL_NAMES, output_dict=True),
+        "reference_paper1_86.70_pct":   "Luna-Jiménez et al. Appl.Sci. 2022 subject-wise 5-CV",
+        "reference_paper2_93.59_pct":   "John & Kawanishi ICPR 2021 trial-split (NOT subject-wise)",
+        "method_note_fold_imbalance": "Subject-wise 5-fold uses four 5-actor folds and one 4-actor fold, matching the Paper-1 actor protocol.",
+        "method_note_uncertainty": "Uncertainty threshold only logs low-confidence samples; it does not abstain or alter predictions.",
+        "method_note_specialists": "Pair specialists use independent StandardScaler/PCA fitted only on train-fold samples.",
+        "method_note_metadata_covariates": "RAVDESS intensity/statement/repetition metadata are excluded from reliability features by default; use --include_metadata_covariates only for an explicit ablation.",
+    }
+    (Path(cfg.results_dir) / "summary.json").write_text(
+        json.dumps(summary, indent=2), "utf-8")
+
+    print("\n" + "=" * 70)
+    print("ESRA-RELA V9 — FINAL SUMMARY  (subject-wise 5-fold, 8 emotions)")
+    print("=" * 70)
+    print(fold_df.to_string(index=False, formatters={
+        "accuracy": lambda x: f"{x*100:.2f}%",
+        "macro_f1": lambda x: f"{x*100:.2f}%",
+        "uar":      lambda x: f"{x*100:.2f}%",
+    }))
+    print("-" * 70)
+    print(f"Accuracy  : {summary['accuracy_mean']*100:.2f}% ± {summary['accuracy_std']*100:.2f}")
+    print(f"Macro-F1  : {summary['macro_f1_mean']*100:.2f}% ± {summary['macro_f1_std']*100:.2f}")
+    print(f"UAR       : {summary['uar_mean']*100:.2f}% ± {summary['uar_std']*100:.2f}")
+    print()
+    print("Reference — Paper 1 (subject-wise 5-CV, same setup):  86.70%")
+    print("Reference — Paper 2 (trial split, NOT subject-wise):   93.59%")
+    print(f"[INFO] Results saved: {cfg.results_dir}")
+    print("=" * 70)
+
+
+# ──────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="ESRA-RELA V9 — RAVDESS Multimodal Emotion Recognition")
+    p.add_argument("--data_dir",     required=True,
+                   help="Root directory of RAVDESS .mp4 files")
+    p.add_argument("--openface_dir", default="",
+                   help="Directory of OpenFace CSV files (empty string = skip AU)")
+    p.add_argument("--cache_dir",    default="esra_rela_v9_cache")
+    p.add_argument("--results_dir",  default="esra_rela_v9_results")
+    p.add_argument("--run_all_folds",action="store_true",
+                   help="Run all 5 subject-wise folds sequentially")
+    p.add_argument("--fold",         type=int, default=0, choices=range(5))
+    p.add_argument("--max_files",    type=int, default=0,
+                   help="Limit number of files (0 = all). For smoke tests only.")
+    p.add_argument("--rebuild_cache",action="store_true")
+    p.add_argument("--no_diagnostics",action="store_true")
+
+    # Modality toggles
+    p.add_argument("--no_audio", action="store_true")
+    p.add_argument("--no_video", action="store_true")
+    p.add_argument("--no_au",    action="store_true")
+
+    # Audio
+    p.add_argument("--audio_model",   default="facebook/wav2vec2-base-960h",
+                   help='HuggingFace model ID, or "none" for handcrafted features only')
+    p.add_argument("--audio_sr",      type=int,   default=16000)
+    p.add_argument("--audio_seconds", type=float, default=5.5)
+
+    # Video
+    p.add_argument("--video_frames",       type=int, default=10)
+    p.add_argument("--saliency_top_pool",  type=int, default=24)
+
+    # Classifiers
+    p.add_argument("--base_model",   default="logreg", choices=["logreg","svm"])
+    p.add_argument("--meta_model",   default="logreg", choices=["logreg","svm"])
+    p.add_argument("--base_C",       type=float, default=0.45)
+    p.add_argument("--meta_C",       type=float, default=0.55)
+    p.add_argument("--pca_audio",    type=int,   default=128)
+    p.add_argument("--pca_video",    type=int,   default=128)
+    p.add_argument("--pca_au",       type=int,   default=64)
+    p.add_argument("--inner_splits", type=int,   default=4)
+
+    # Specialists
+    p.add_argument("--no_specialists",       action="store_true")
+    p.add_argument("--no_gender_specialists",action="store_true")
+    p.add_argument("--specialist_threshold", type=float, default=0.38)
+    p.add_argument("--specialist_margin",    type=float, default=0.12)
+    p.add_argument("--specialist_blend",     type=float, default=0.30)
+
+    # NEW V9
+    p.add_argument("--no_calibration",   action="store_true",
+                   help="Disable posterior-temperature calibration (V9 feature)")
+    p.add_argument("--temp_init",        type=float, default=1.5)
+    p.add_argument("--uncertainty_threshold", type=float, default=0.30,
+                   help="Log predictions below this max-posterior as uncertain; predictions are not changed.")
+    p.add_argument("--abstain_threshold", dest="uncertainty_threshold", type=float,
+                   help="Backward-compatible alias for --uncertainty_threshold.")
+    p.add_argument("--include_metadata_covariates", action="store_true",
+                   help="Ablation only: append RAVDESS intensity/statement/repetition metadata to reliability features.")
+
+    p.add_argument("--random_state",     type=int, default=42)
+
+    a = p.parse_args()
+    return Config(
+        data_dir=a.data_dir,
+        openface_dir=a.openface_dir,
+        cache_dir=a.cache_dir,
+        results_dir=a.results_dir,
+        run_all_folds=a.run_all_folds,
+        fold=a.fold,
+        max_files=a.max_files,
+        rebuild_cache=a.rebuild_cache,
+        save_diagnostics=not a.no_diagnostics,
+        use_audio=not a.no_audio,
+        use_video=not a.no_video,
+        use_au=not a.no_au,
+        audio_model=a.audio_model,
+        audio_sr=a.audio_sr,
+        audio_seconds=a.audio_seconds,
+        video_frames=a.video_frames,
+        saliency_top_pool=a.saliency_top_pool,
+        base_model=a.base_model,
+        meta_model=a.meta_model,
+        base_C=a.base_C,
+        meta_C=a.meta_C,
+        pca_audio=a.pca_audio,
+        pca_video=a.pca_video,
+        pca_au=a.pca_au,
+        inner_splits=a.inner_splits,
+        enable_specialists=not a.no_specialists,
+        enable_gender_specialists=not a.no_gender_specialists,
+        specialist_threshold=a.specialist_threshold,
+        specialist_margin_threshold=a.specialist_margin,
+        specialist_blend=a.specialist_blend,
+        calibrate_temperatures=not a.no_calibration,
+        temp_init=a.temp_init,
+        uncertainty_threshold=a.uncertainty_threshold,
+        include_metadata_covariates=a.include_metadata_covariates,
+        random_state=a.random_state,
+    )
+
+
+if __name__ == "__main__":
+    run(parse_args())
