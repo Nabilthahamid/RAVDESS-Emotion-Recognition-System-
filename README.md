@@ -1,4 +1,4 @@
-# ESRA-RELA++: Emotion-Saliency and Reliability-Aware Multimodal Fusion for RAVDESS Emotion Recognition
+# ESRA-RELA: Emotion-Saliency and Reliability-Aware Multimodal Fusion for RAVDESS Emotion Recognition
 
 A publication-oriented, reproducible multimodal emotion-recognition project using the **RAVDESS** audio-visual dataset.  
 The project focuses on **subject-wise actor-independent emotion recognition**, where test actors are unseen during training.
@@ -63,7 +63,7 @@ This makes the task harder than random or trial-based splitting, but it better e
 
 ## Main Contributions
 
-This project proposes and evaluates **ESRA-RELA++**, an emotion-saliency and reliability-aware multimodal fusion framework.
+This project proposes and evaluates **ESRA-RELA**, an emotion-saliency and reliability-aware multimodal fusion framework.
 
 Key contributions:
 
@@ -119,7 +119,7 @@ Key contributions:
 
 The best-performing configuration was:
 
-> **ESRA-RELA++ Calibrated Simple-Average Fusion without LoRA and without specialist correction**
+> **ESRA-RELA Calibrated Simple-Average Fusion without LoRA and without specialist correction**
 
 Final subject-wise 5-fold result:
 
